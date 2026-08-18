@@ -13,6 +13,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 
 # Optional web server for Render / Fly
 from fastapi import FastAPI
+import threading
 
 # Google Drive client (optional service account)
 from google.oauth2 import service_account
@@ -143,7 +144,7 @@ def download_public_drive_file(file_id, target_folder="bibliografia", prefer_nam
             cd = r.headers.get('content-disposition')
             filename = None
             if cd:
-                m = re.search(r'filename\*=UTF-8''(.+)', cd)
+                m = re.search(r"filename\*=UTF-8''(.+)", cd)
                 if m:
                     filename = requests.utils.unquote(m.group(1))
                 else:
@@ -314,13 +315,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Error procesando mensaje")
         await update.message.reply_text("Ocurrió un error al procesar el mensaje. Por favor intentá de nuevo.")
 
-# --- FastAPI wrapper so app can run on platforms that expect a web process (eg. Fly.io) ---
+# --- FastAPI wrapper so app can run on Fly.io (and similar platforms) ---
 app = FastAPI()
 bot_app = None
 
 @app.on_event("startup")
 async def startup_event():
-    # Sync Drive files at startup
+    # Sync Drive files at startup (best-effort)
     try:
         sync_drive_files(GOOGLE_DRIVE_FOLDER_ID)
     except Exception as e:
@@ -337,15 +338,23 @@ async def startup_event():
     bot_app.add_handler(CommandHandler('start', start))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    # Run polling in background
-    asyncio.create_task(bot_app.run_polling())
+    # Run polling in a separate thread to avoid "event loop already running"
+    def _run_bot():
+        try:
+            asyncio.run(bot_app.run_polling())
+        except Exception as e:
+            logger.exception("Bot polling thread failed")
+
+    threading.Thread(target=_run_bot, daemon=True).start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global bot_app
     if bot_app:
         try:
+            # Attempt a graceful stop
             await bot_app.stop()
+            await bot_app.shutdown()
         except Exception:
             pass
 
