@@ -25,4 +25,4 @@ RUN mkdir -p /app/bibliografia
 EXPOSE 8080
 
 # Use PORT env var if provided by platform; fallback to 8080
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "python worker.py & uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
