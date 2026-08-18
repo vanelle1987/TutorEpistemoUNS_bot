@@ -11,6 +11,9 @@ from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
+# Optional web server for Render / Fly
+from fastapi import FastAPI
+
 # Google Drive client (optional service account)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -230,7 +233,6 @@ def cargar_instrucciones():
     return "Sos Episte, tutor socrático en Epistemología (UNS)."
 
 # --- 3. EXTRAER TEXTO DE TODOS LOS PDFS EN LA CARPETA 'bibliografia/' ---
-
 def extraer_texto_bibliografia():
     texto_consolidado = ""
     archivos_pdf = glob.glob("bibliografia/*.pdf")
@@ -312,10 +314,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Error procesando mensaje")
         await update.message.reply_text("Ocurrió un error al procesar el mensaje. Por favor intentá de nuevo.")
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    logger.info("🤖 Bot activo y escuchando en Telegram con la bibliografía sincronizada desde Google Drive...")
-    app.run_polling(drop_pending_updates=True)
+# --- FastAPI wrapper so app can run on platforms that expect a web process (eg. Fly.io) ---
+app = FastAPI()
+bot_app = None
+
+@app.on_event("startup")
+async def startup_event():
+    # Sync Drive files at startup
+    try:
+        sync_drive_files(GOOGLE_DRIVE_FOLDER_ID)
+    except Exception as e:
+        logger.warning(f"Drive sync failed at startup: {e}")
+
+    # Start the telegram bot if token present
+    global bot_app
+    if not TELEGRAM_TOKEN:
+        logger.warning("TELEGRAM_TOKEN not set; bot will not start.")
+        return
+
+    logger.info("Starting Telegram bot application...")
+    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    bot_app.add_handler(CommandHandler('start', start))
+    bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    # Run polling in background
+    asyncio.create_task(bot_app.run_polling())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global bot_app
+    if bot_app:
+        try:
+            await bot_app.stop()
+        except Exception:
+            pass
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
