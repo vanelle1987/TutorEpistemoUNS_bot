@@ -1,0 +1,7 @@
+google-genai
+python-telegram-bot
+nest_asyncio
+pypdf
+google-api-python-client
+google-auth
+requests
