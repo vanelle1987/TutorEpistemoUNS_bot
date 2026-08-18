@@ -5,16 +5,18 @@ import asyncio
 import nest_asyncio
 import json
 import base64
+import re
 from pathlib import Path
 from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-# Google Drive client
+# Google Drive client (optional service account)
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import io
+import requests
 
 nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +28,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.6-flash")
 
 # Google Drive env vars
-# You can provide the service account JSON either as raw JSON in GOOGLE_SERVICE_ACCOUNT_JSON
-# or as base64-encoded JSON in GOOGLE_SERVICE_ACCOUNT_JSON_B64.
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # folder containing PDFs and instrucciones.txt
@@ -44,7 +44,8 @@ except Exception:
     client = None
     logger.info("genai client not configured (missing GEMINI_API_KEY or google-genai package).")
 
-# --- Google Drive helpers ---
+# --- Helpers for service-account Drive access (preferred if available) ---
+
 def load_service_account_info():
     if GOOGLE_SERVICE_ACCOUNT_JSON:
         return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -57,7 +58,7 @@ def load_service_account_info():
 def init_drive_service():
     sa_info = load_service_account_info()
     if not sa_info:
-        logger.info("No Google service account credentials provided; skipping Drive sync.")
+        logger.info("No Google service account credentials provided; skipping authenticated Drive sync.")
         return None
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
@@ -67,8 +68,7 @@ def init_drive_service():
     return drive
 
 
-def list_files_in_folder(drive, folder_id):
-    # Query for files in the folder (not trashed)
+def list_files_in_folder_authenticated(drive, folder_id):
     q = f"'{folder_id}' in parents and trashed = false"
     files = []
     page_token = None
@@ -81,7 +81,7 @@ def list_files_in_folder(drive, folder_id):
     return files
 
 
-def download_file_to_folder(drive, file_id, filename, target_folder="bibliografia"):
+def download_file_to_folder_authenticated(drive, file_id, filename, target_folder="bibliografia"):
     Path(target_folder).mkdir(parents=True, exist_ok=True)
     request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
@@ -94,58 +94,127 @@ def download_file_to_folder(drive, file_id, filename, target_folder="bibliografi
         target_path = Path(target_folder) / filename
         with open(target_path, "wb") as f:
             f.write(fh.read())
-        logger.info(f"Downloaded {filename} to {target_path}")
+        logger.info(f"Downloaded {filename} to {target_path} (auth)")
         return True
     except Exception as e:
-        logger.warning(f"Failed to download {filename}: {e}")
+        logger.warning(f"Failed to download {filename} via auth: {e}")
         return False
 
+# --- Helpers for public Drive access (no Google Cloud keys) ---
+
+def list_files_in_public_folder(folder_id):
+    """Attempt to extract file IDs from a public Drive folder page by scraping the HTML.
+    This is a best-effort approach and may break if Google changes their page structure.
+    Returns a list of file IDs (strings).
+    """
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            logger.warning(f"Failed to fetch Drive folder page: status {r.status_code}")
+            return []
+        html = r.text
+        # Find occurrences of /file/d/<id>/ or /open?id=<id>
+        ids = set(re.findall(r"/file/d/([A-Za-z0-9_-]{10,})", html))
+        ids.update(re.findall(r"\?id=([A-Za-z0-9_-]{10,})", html))
+        # Also try to find any doc ids present in the page data
+        ids.update(re.findall(r'"(1[A-Za-z0-9_-]{20,})"', html))
+        ids_list = list(ids)
+        logger.info(f"Scraped {len(ids_list)} file id(s) from public folder page (best-effort).")
+        return ids_list
+    except Exception as e:
+        logger.warning(f"Error scraping Drive folder page: {e}")
+        return []
+
+
+def download_public_drive_file(file_id, target_folder="bibliografia", prefer_name=None):
+    Path(target_folder).mkdir(parents=True, exist_ok=True)
+    # Use the uc?export=download endpoint
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            if r.status_code != 200:
+                logger.warning(f"Drive download returned status {r.status_code} for {file_id}")
+                return False, None
+            # Try to get filename from headers
+            cd = r.headers.get('content-disposition')
+            filename = None
+            if cd:
+                m = re.search(r'filename\*=UTF-8''(.+)', cd)
+                if m:
+                    filename = requests.utils.unquote(m.group(1))
+                else:
+                    m = re.search(r'filename="?([^\";]+)"?', cd)
+                    if m:
+                        filename = m.group(1)
+            if not filename and prefer_name:
+                filename = prefer_name
+            if not filename:
+                # fallback
+                filename = f"{file_id}.pdf"
+
+            # Decide target path: instrucciones.txt stored at repo root, otherwise bibliografia/
+            if filename.lower() == 'instrucciones.txt':
+                target_path = Path(filename)
+            else:
+                target_path = Path(target_folder) / filename
+
+            # Stream to file
+            with open(target_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+            logger.info(f"Downloaded public file {filename} to {target_path}")
+            return True, filename
+    except Exception as e:
+        logger.warning(f"Exception downloading public file {file_id}: {e}")
+        return False, None
+
+# --- Sync logic that picks method (auth > public scraping > nothing) ---
 
 def sync_drive_files(folder_id):
+    # Try authenticated first
     drive = init_drive_service()
-    if drive is None:
-        return
-    if not folder_id:
-        logger.warning("No GOOGLE_DRIVE_FOLDER_ID provided; skipping Drive sync.")
-        return
+    if drive is not None:
+        try:
+            files = list_files_in_folder_authenticated(drive, folder_id)
+            logger.info(f"Found {len(files)} files via authenticated Drive API")
+            for f in files:
+                file_id = f.get('id')
+                name = f.get('name')
+                lower_name = (name or '').lower()
+                if lower_name.endswith('.pdf'):
+                    target = Path('bibliografia') / name
+                elif lower_name == 'instrucciones.txt':
+                    target = Path('instrucciones.txt')
+                else:
+                    # skip other files
+                    logger.info(f"Skipping non-pdf/instrucciones file (auth): {name}")
+                    continue
 
-    # List files and download PDFs + instrucciones.txt
-    files = list_files_in_folder(drive, folder_id)
-    logger.info(f"Found {len(files)} file(s) in Drive folder {folder_id}.")
-    for f in files:
-        file_id = f.get("id")
-        name = f.get("name")
-        lower_name = name.lower() if name else ""
-        should_download = False
-        if lower_name.endswith('.pdf'):
-            should_download = True
-        if lower_name == 'instrucciones.txt':
-            should_download = True
+                if target.exists() and not FORCE_DRIVE_SYNC:
+                    logger.info(f"Skipping existing {target}")
+                    continue
 
-        if not should_download:
-            logger.info(f"Skipping Drive file (not pdf/instrucciones): {name}")
-            continue
+                download_file_to_folder_authenticated(drive, file_id, name, target_folder='.' if lower_name == 'instrucciones.txt' else 'bibliografia')
+            return
+        except Exception as e:
+            logger.warning(f"Authenticated Drive sync failed: {e}")
 
-        target_path = Path("bibliografia") / name if lower_name.endswith('.pdf') else Path(name)
-        # If instrucciones.txt, save at repo root so cargar_instrucciones picks it up; otherwise save in bibliografia/
-        if name.lower() == 'instrucciones.txt':
-            local_exists = Path(name).exists()
-        else:
-            local_exists = Path("bibliografia") / name
-
-        if local_exists and not FORCE_DRIVE_SYNC:
-            logger.info(f"Skipping existing file {name}")
-            continue
-
-        # Download
-        if name.lower() == 'instrucciones.txt':
-            # download to repo root
-            success = download_file_to_folder(drive, file_id, name, target_folder='.')
-        else:
-            success = download_file_to_folder(drive, file_id, name, target_folder='bibliografia')
-
-        if not success:
-            logger.warning(f"Failed to download {name}")
+    # Fallback to public folder scraping
+    if folder_id:
+        logger.info("Attempting public Drive folder scraping (no service account).")
+        ids = list_files_in_public_folder(folder_id)
+        if not ids:
+            logger.warning("No file ids found in public folder scraping; skipping Drive sync.")
+            return
+        for file_id in ids:
+            # Try to download each file; Drive will provide filename in headers when possible
+            success, filename = download_public_drive_file(file_id, target_folder='bibliografia')
+            if not success:
+                logger.warning(f"Failed to download public file {file_id}")
+    else:
+        logger.info("No Drive folder id provided; skipping Drive sync.")
 
 # --- 2. LEER INSTRUCCIONES DEL TUTOR ---
 def cargar_instrucciones():
@@ -161,6 +230,7 @@ def cargar_instrucciones():
     return "Sos Episte, tutor socrático en Epistemología (UNS)."
 
 # --- 3. EXTRAER TEXTO DE TODOS LOS PDFS EN LA CARPETA 'bibliografia/' ---
+
 def extraer_texto_bibliografia():
     texto_consolidado = ""
     archivos_pdf = glob.glob("bibliografia/*.pdf")
