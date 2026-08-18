@@ -1,0 +1,4 @@
+app = "tutor-epistemo"
+
+[processes]
+app = "sh -c 'python worker.py & uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}'"
