@@ -5,3 +5,5 @@ pypdf
 google-api-python-client
 google-auth
 requests
+fastapi
+uvicorn[standard]
